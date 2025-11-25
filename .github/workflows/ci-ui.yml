@@ -1,0 +1,68 @@
+name: CI - UI Project
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'ui-project/**'
+      - '.github/workflows/ci-ui.yml'
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'ui-project/**'
+      - '.github/workflows/ci-ui.yml'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./ui-project
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 8
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+          cache-dependency-path: ui-project/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Type check
+        run: pnpm run typecheck
+
+      - name: Build
+        run: pnpm run build
+
+  docker-build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./ui-project
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./ui-project
+          file: ./ui-project/Dockerfile
+          push: false
+          tags: ui-project:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

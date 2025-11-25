@@ -1,0 +1,43 @@
+name: CI - Docker Compose
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'api-project/**'
+      - 'ui-project/**'
+      - 'docker-compose.yml'
+      - '.github/workflows/ci-docker-compose.yml'
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'api-project/**'
+      - 'ui-project/**'
+      - 'docker-compose.yml'
+      - '.github/workflows/ci-docker-compose.yml'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and test with Docker Compose
+        run: |
+          docker compose build
+          docker compose up -d
+          sleep 10
+          
+          # Test API
+          curl -f http://localhost:8000/ || exit 1
+          curl -f http://localhost:8000/hello/test || exit 1
+          
+          # Test UI (basic connectivity)
+          curl -f http://localhost:3000/ || exit 1
+          
+          docker compose down
