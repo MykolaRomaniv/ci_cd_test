@@ -2,6 +2,15 @@
 
 This project consists of two services: a Python API backend and a React Router UI frontend, both containerized with Docker.
 
+## Documentation
+
+For more detailed information about specific components of this project, see:
+
+- **[API Project README](api-project/README.md)** - FastAPI backend setup, endpoints, and development guide
+- **[UI Project README](ui-project/README.md)** - React Router frontend setup, features, and deployment guide
+- **[CI/CD Pipelines README](.github/workflows/README.md)** - GitHub Actions workflows, CI/CD configuration, and deployment details
+- **[Architecture documentation](docs/)** - General documentation on architecture, infrastructure, deployment, cloud
+
 ## Prerequisites
 
 - [Docker](https://www.docker.com/get-started) (version 20.10 or later)
