@@ -3,16 +3,15 @@ FROM python:3.14-slim
 WORKDIR /app
 
 # Install UV
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-# Add UV to PATH
-# ENV PATH="/root/.local/bin:$PATH"
+# COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 # Copy dependency files
 COPY pyproject.toml uv.lock* ./
 
 # Install dependencies using UV
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --system --no-dev
+    uv sync --frozen --no-dev
 
 # Copy application code
 COPY main.py ./
@@ -21,4 +20,4 @@ COPY main.py ./
 EXPOSE 8000
 
 # Run the application
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uv", "run", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
