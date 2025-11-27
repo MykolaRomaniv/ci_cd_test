@@ -1,8 +1,8 @@
-name: CD - Build and Deploy
+name: CD - Build and Deploy to GCP
 
 on:
   push:
-    branches: [main]
+    branches: [release]
     paths:
       - 'api-project/**'
       - 'ui-project/**'
@@ -10,95 +10,95 @@ on:
   workflow_dispatch:
 
 env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME_API: ${{ github.repository }}/api-project
-  IMAGE_NAME_UI: ${{ github.repository }}/ui-project
+  # --- GCP config (dummy values, replace with your real ones or secrets) ---
+  GCP_PROJECT_ID: 'dummy-gcp-project-id'
+  GCP_REGION: 'europe-west4'
+  GAR_LOCATION: 'europe-west4'                          # Artifact Registry location
+  ARTIFACT_REGISTRY_REPO: 'dummy-artifact-repo'         # Artifact Registry repository name
+  CLOUD_RUN_SERVICE_API: 'dummy-api-service'            # Cloud Run service name for FastAPI
+  GCS_BUCKET_UI: 'dummy-ui-bucket'                      # GCS bucket for React SPA
+  CLOUD_CDN_URL_MAP: 'dummy-url-map-name'               # (optional) URL map name for CDN invalidation
 
 jobs:
-  build-and-push-api:
+  build-and-deploy:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
+      id-token: write   # required for google-github-actions/auth
 
     steps:
+      # 1. Checkout repository
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to Container Registry
-        uses: docker/login-action@v3
+      # 2. Authenticate to GCP (using service account key stored in GitHub Secrets)
+      #    Need a GitHub secret called GCP_SA_KEY with the JSON key for a deploy SA.
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          credentials_json: '${{ secrets.GCP_SA_KEY }}'
 
-      - name: Extract metadata for API
-        id: meta-api
-        uses: docker/metadata-action@v5
+      # 3. Install gcloud CLI
+      - name: Set up gcloud SDK
+        uses: google-github-actions/setup-gcloud@v2
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_API }}
-          tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha,prefix={{branch}}-
-            type=raw,value=latest,enable={{is_default_branch}}
+          project_id: ${{ env.GCP_PROJECT_ID }}
 
+      # 4. Configure Docker to push to Artifact Registry
+      - name: Configure Docker for Artifact Registry
+        run: |
+          gcloud auth configure-docker ${{ env.GAR_LOCATION }}-docker.pkg.dev --quiet
+
+      # 5. Build & push API Docker image to Artifact Registry
       - name: Build and push API image
+        id: build-api
         uses: docker/build-push-action@v5
         with:
           context: ./api-project
           file: ./api-project/Dockerfile
           push: true
-          tags: ${{ steps.meta-api.outputs.tags }}
-          labels: ${{ steps.meta-api.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  build-and-push-ui:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract metadata for UI
-        id: meta-ui
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_UI }}
           tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha,prefix={{branch}}-
-            type=raw,value=latest,enable={{is_default_branch}}
+            ${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.ARTIFACT_REGISTRY_REPO }}/api-project:${{ github.sha }}
+            ${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.ARTIFACT_REGISTRY_REPO }}/api-project:latest
 
-      - name: Build and push UI image
-        uses: docker/build-push-action@v5
+      # 6. Deploy API to Cloud Run (FastAPI backend)
+      - name: Deploy API to Cloud Run
+        run: |
+          IMAGE="${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.ARTIFACT_REGISTRY_REPO }}/api-project:${{ github.sha }}"
+          gcloud run deploy "${{ env.CLOUD_RUN_SERVICE_API }}" \
+            --image "$IMAGE" \
+            --region "${{ env.GCP_REGION }}" \
+            --platform managed \
+            --ingress internal-and-cloud-load-balancing \
+            --allow-unauthenticated=false \
+            --quiet
+
+      # 7. Install Node.js for UI build
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
         with:
-          context: ./ui-project
-          file: ./ui-project/Dockerfile
-          push: true
-          tags: ${{ steps.meta-ui.outputs.tags }}
-          labels: ${{ steps.meta-ui.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          node-version: '20'
+
+      # 8. Install dependencies & build React UI
+      - name: Install UI dependencies
+        working-directory: ./ui-project
+        run: npm ci
+
+      - name: Build UI
+        working-directory: ./ui-project
+        run: npm run build
+
+      # 9. Sync built UI to GCS bucket (Cloud Storage + Cloud CDN)
+      #    Ensure the bucket is fronted by HTTPS LB + Cloud CDN per architecture.
+      - name: Upload UI build to GCS
+        run: |
+          gsutil -m rsync -r ./ui-project/build gs://${{ env.GCS_BUCKET_UI }}
+
+      # 10. (Optional) Invalidate Cloud CDN cache so new UI is served immediately
+      #     Requires that HTTPS LB / URL map is already configured.
+      - name: Invalidate Cloud CDN cache
+        if: ${{ always() }}     # run but ignore failures if URL map not found
+        run: |
+          gcloud compute url-maps invalidate-cdn-cache "${{ env.CLOUD_CDN_URL_MAP }}" \
+            --path "/*" \
+            --quiet || echo "CDN invalidation skipped (check URL map name or permissions)"
