@@ -45,6 +45,8 @@ jobs:
           curl -f http://localhost:8000/hello/test || (kill $SERVER_PID && exit 1)
           kill $SERVER_PID
 
+      # TODO: Add linters and tests
+
   docker-build:
     runs-on: ubuntu-latest
     defaults:

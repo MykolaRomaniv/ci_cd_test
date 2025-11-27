@@ -1,26 +1,20 @@
-FROM node:20-alpine AS development-dependencies-env
-COPY . /app
-WORKDIR /app
-RUN npm install pnpm -g
-RUN pnpm install --frozen-lockfile
+# Build the web app
 
-FROM node:20-alpine AS production-dependencies-env
+FROM node:24-alpine
+
+WORKDIR /app
+
+RUN npm install pnpm -g
+
+# Copy the dependency list (package.json and pnpm-lock.yaml)
 COPY ./package.json pnpm-lock.yaml /app/
-WORKDIR /app
-RUN npm install pnpm -g
-RUN pnpm install --frozen-lockfile --prod
 
-FROM node:20-alpine AS build-env
+# In case we need to use a private npm registry
+# COPY ./.npmrc /app/
+
+# Copy the rest of the app
 COPY . /app/
-COPY --from=development-dependencies-env /app/node_modules /app/node_modules
-WORKDIR /app
-RUN npm install pnpm -g
-RUN pnpm run build
 
-FROM node:20-alpine
-COPY ./package.json pnpm-lock.yaml /app/
-COPY --from=production-dependencies-env /app/node_modules /app/node_modules
-COPY --from=build-env /app/build /app/build
-WORKDIR /app
-RUN npm install pnpm -g
+# Install dependencies
+RUN pnpm install --frozen-lockfile
 CMD ["pnpm", "run", "start"]
