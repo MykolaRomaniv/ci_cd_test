@@ -1,304 +1,328 @@
-## **PART 1 — Architecture & Deployment Design (Google Cloud)**
+## **1\. System Architecture & Diagram**
 
-### **1\. High-Level Overview**
+### **Main components**
 
-We have a 3-service system:
+* **Frontend**: React SPA  
+  * Built as static assets.  
+  * Hosted in **Cloud Storage**.  
+  * Fronted by **Cloud CDN** \+ **External HTTPS Load Balancer**.
 
-* **React frontend** (SPA)
+* **Backend**: FastAPI  
+  * Containerized and deployed to **Cloud Run (fully managed)**.  
+  * Exposed via the same **HTTPS Load Balancer** under /api.
 
-* **FastAPI backend** (REST API)
+* **Database**: MongoDB  
+  * **Managed MongoDB Atlas cluster on GCP** (preferred for simplicity & reliability).  
+  * Deployed in the same region as Cloud Run.  
+  * Connected via **VPC peering** between GCP VPC and Atlas VPC.
 
-* **MongoDB database**
+* **Supporting services**  
+  * **Artifact Registry** for container images.  
+  * **Cloud Build** for CI/CD.  
+  * **Secret Manager** for secrets.  
+  * **Cloud Monitoring & Logging** for observability.  
+  * **Cloud Armor** (optional but recommended) for WAF/rate limiting.
 
-Target: production-ready deployment on **Google Cloud Platform (GCP)** with CI/CD, zero-downtime releases, observability, and separate Dev / Staging / Production environments.
+  ### **Networking & traffic flow**
 
----
+* **VPC (per environment)**:  
+  * One **custom VPC** with subnets in at least 2 zones.  
+  * External HTTPS LB & Cloud CDN are public.  
+  * Cloud Run is regional, attached to VPC via **Serverless VPC Connector** for private DB access.  
+  * MongoDB Atlas is reachable only via **VPC peering** (no public IPs).
 
-### **2\. System Architecture**
+**Health checks**:
 
-**Main components (GCP):**
+* HTTPS LB performs HTTP health checks on **/health** endpoint of the FastAPI service.  
+* React SPA health (static hosting) is checked by LB verifying 200 on /index.html.  
+* MongoDB Atlas has its own cluster health & monitoring; application also exposes DB connectivity status on /health if needed.
 
-* **Client:** Browser.
+**Service discovery**:
 
-* **Static hosting \+ CDN:** React build in **Cloud Storage** bucket, fronted by **Cloud CDN** via an external HTTPS Load Balancer.
+* Frontend calls backend via a **single API base URL** (e.g. https://api.myapp.com) configured as build-time env variable.  
+* Backend reads Mongo connection string from Secret Manager; DNS resolution to Atlas via VPC peering.
 
-* **API entrypoint:** **External HTTP(S) Load Balancer** routing traffic to **GKE** (Google Kubernetes Engine) services.
+**Internal vs external traffic**:
 
-* **Backend:** FastAPI containers running as Deployments in **GKE** (private nodes).
+* Only **HTTPS LB** and **Cloud CDN** are exposed to the public internet.  
+* Cloud Run service is configured with **“internal \+ LB”** access (no direct public invocation).  
+* MongoDB cluster has **no public endpoint**; access only from the peered VPC.
 
-* **Database:** **MongoDB Atlas on GCP** (or self-managed MongoDB on GCE/GKE) connected via **VPC peering / Private Service Connect**.
+## **2\. Deployment Environments & CI/CD**
 
-* **Networking:**
+### **Environment separation**
 
-  * Single **VPC**.
+Use **separate GCP projects** for clean isolation:
 
-  * **Public subnets** for load balancer frontend (and optionally bastion).
+* myapp-dev  
+* myapp-stg  
+* myapp-prod
 
-  * **Private subnets** for GKE node pools and MongoDB.
+Each project has:
 
-  * **Cloud NAT** for outbound internet access from private workloads.
+* Its own **VPC**, **Cloud Run service**, **Cloud Storage bucket**, **Secret Manager entries**, and **MongoDB database/cluster or separate DBs** within a shared Atlas project.  
+* Per-env domains, e.g.:  
+  * dev.myapp.com, dev-api.myapp.com  
+  * stg.myapp.com, stg-api.myapp.com  
+  * app.myapp.com, api.myapp.com
 
-* **Service discovery:** Kubernetes Services \+ DNS; health checks via Load Balancer and K8s probes.
+### **CI/CD pipeline (simple but robust)**
 
-**Traffic flow:**
+Use **Cloud Build** triggered from GitHub/GitLab:
 
-* Browser → HTTPS Load Balancer \+ Cloud CDN → Cloud Storage (static assets).
+1. **On push / PR to develop** (dev):  
+   * Run unit tests (frontend & backend).  
+   * Build Docker image for FastAPI → push to **Artifact Registry**.  
+   * Build React → upload static assets to **dev** Cloud Storage bucket.  
+   * Deploy new revision of FastAPI to **Cloud Run (dev)**.  
+   * Optionally, run smoke tests.
 
-* Browser/API calls → HTTPS Load Balancer → GKE (FastAPI service).
+2. **On merge to main** (staging):  
+   * Same steps as dev but targeting **staging** project/resources.  
+   * Deploy using **canary rollout** (e.g. 10% traffic to new revision).  
+   * Run integration tests against staging.
 
-* FastAPI → MongoDB Atlas over private network.
+3. **Promotion to production**:  
+   * Triggered by **manual approval** in Cloud Build.  
+   * Reuse **the same images/artifacts** that passed in staging (immutable artifact promotion).  
+   * Deploy to **Cloud Run (prod)** with canary (see zero-downtime section).  
+   * Sync React build to prod bucket.  
+   * Post-deployment smoke tests and rollback if needed.
 
-### **3\. Deployment Environments**
+This keeps CI/CD straightforward: **one pipeline**, with **per-env config** controlled via substitution variables (project ID, bucket name, Cloud Run service name, Secret Manager paths).
 
-**Environments:**
+## **3\. Zero-Downtime Deployment Strategy – Canary on Cloud Run**
 
-* **Dev**
+**I’d use canary releases leveraging Cloud Run’s traffic splitting by revision:**
 
-  * Single **GKE** cluster with `dev` namespace.
+* **For each new backend release:**
 
-  * Small node pool (preemptible nodes optional to save cost).
+1. Deploy a new Cloud Run revision (no traffic yet).  
+2. Shift 5–10% of traffic to the new revision.  
+3. Monitor key metrics (5xx rate, latency, error logs) for a defined window (e.g. 30–60 minutes).  
+4. If healthy, gradually increase to 50% and then 100%.  
+5. If issues arise, instantly rollback by routing 100% traffic back to the previous revision (no redeploy needed).
 
-  * Dev MongoDB Atlas project/cluster on lower tier.
+**When/why:**
 
-  * Used for feature branches and quick feedback.
+* **Use canary for all production deployments, especially when:**  
+  * Changes are non-trivial (DB queries, auth, business logic).  
+  * We want to protect SLOs while still continuously delivering.
 
-* **Staging**
+**For the frontend, because it’s static:**
 
-  * Separate `staging` namespace (or separate GKE cluster if required).
+* Upload new build to a versioned path in Cloud Storage (e.g. /releases/2025-11-27/).  
+* Update load balancer backend or rewrite rule to point to the new version.  
+* If something breaks, switch back to the previous version (effectively a blue/green pattern for static assets).
 
-  * Mirrors production config as closely as possible.
+## **4\. Scalability & High Availability**
 
-  * Uses anonymized/synthetic data.
+### **Horizontal scaling**
 
-  * Target for automated e2e tests and release validation.
+* **Cloud Run**:  
+  * Auto-scales based on **concurrent requests**.  
+  * Configure:  
+    * max-instances high enough to handle expected peak.  
+    * concurrency (e.g. 40–80) depending on CPU intensity of FastAPI endpoints.
 
-* **Production**
+* **React SPA**:  
+  * Cloud Storage \+ Cloud CDN are inherently horizontally scalable; no app server to scale.
 
-  * Dedicated **GKE** cluster (separate project or at least separate VPC).
+* **MongoDB Atlas**:  
+  * Use a **3-node replica set** spread across **multiple zones** in the same region.  
+  * Vertically scale cluster tier as necessary.  
+  * Optionally enable auto-scaling (Atlas feature).
 
-  * **Multi-zone** node pools for HA.
+### **CPU/memory auto-scaling**
 
-  * Production MongoDB Atlas cluster with replica set across zones.
+* Cloud Run:  
+  * Configure **CPU/memory per instance** based on profiling (e.g. 1 vCPU, 512–1024MB).  
+  * Requests drive instance count; no need to manually handle CPU scaling.
 
-  * Strict IAM, network boundaries, and higher resource limits.
+### **Load balancing & multi-zone HA**
 
-**Promotion flow:**
+* **External HTTPS Load Balancer**:  
+  * Global LB that routes traffic to Cloud CDN / Cloud Storage and Cloud Run.  
+  * Regionally deploy Cloud Run in a region with **multiple zones**.
 
-1. **Dev:** Every push/PR to `dev` → build, test, deploy to dev namespace.
+* **High availability**:  
+  * Cloud Run is **regional multi-zonal**.  
+  * MongoDB replica set ensures failover between zones.  
+  * Buckets & CDN are replicated; no single-zone dependency for static content.
 
-2. **Staging:** Merge to `main` or release branch → deploy to staging.
+## **5\. Scalability & High Availability**
 
-3. **Production:** Only tagged releases (`vX.Y.Z`) and **manual approval** (e.g., protected environment / Cloud Deploy approval) → deploy to prod using same container images.
+### **Horizontal scaling**
 
-This keeps artefacts **immutable** across environments.
+* **Cloud Run**:  
+  * Auto-scales based on **concurrent requests**.  
+  * Configure:  
+    * max-instances high enough to handle expected peak.  
+    * concurrency (e.g. 40–80) depending on CPU intensity of FastAPI endpoints.
 
-### **5\. Zero-Downtime Deployment**
+* **React SPA**:  
+  * Cloud Storage \+ Cloud CDN are inherently horizontally scalable; no app server to scale.
 
-Use **GKE Deployments** with **rolling updates**:
+* **MongoDB Atlas**:  
+  * Use a **3-node replica set** spread across **multiple zones** in the same region.  
+  * Vertically scale cluster tier as necessary.  
+  * Optionally enable auto-scaling (Atlas feature).
 
-* K8s Deployment configured with:
+### **CPU/memory auto-scaling**
 
-  * `maxSurge: 1`
+* Cloud Run:  
+  * Configure **CPU/memory per instance** based on profiling (e.g. 1 vCPU, 512–1024MB).  
+  * Requests drive instance count; no need to manually handle CPU scaling.
 
-  * `maxUnavailable: 0`
+### **Load balancing & multi-zone HA**
 
-* **Readiness probes** gate traffic until containers are healthy.
+* **External HTTPS Load Balancer**:  
+  * Global LB that routes traffic to Cloud CDN / Cloud Storage and Cloud Run.  
+  * Regionally deploy Cloud Run in a region with **multiple zones**.
 
-* **Liveness probes** ensure unhealthy pods are restarted.
+* **High availability**:  
+  * Cloud Run is **regional multi-zonal**.  
+  * MongoDB replica set ensures failover between zones.  
+  * Buckets & CDN are replicated; no single-zone dependency for static content.
 
-Result: old pods stay serving until new pods are up and ready → **no downtime**.
+## **6\. Monitoring & Alerting**
 
-For larger scale / higher-risk changes:
+Use **Cloud Monitoring** \+ **Cloud Logging**.
 
-* **Blue/Green (on GKE):** Two versions of the deployment or two Services/Ingresses; switch backend service on the HTTP(S) Load Balancer.
+### **Metrics to collect**
 
-* **Canary:** Separate Service/Deployment and route a percentage of traffic via **Traffic Director** or custom ingress rules.
+* **Backend (Cloud Run / FastAPI)**:  
+  * Request count, latency (p50, p95, p99).  
+  * HTTP 4xx and 5xx rates.  
+  * Instance CPU & memory utilization.  
+  * Concurrency and instance count.
 
-For this app, state: **Rolling updates as default**, Blue/Green or Canary for big risky releases.
+* **Frontend**:  
+  * LB & Cloud CDN metrics (request count, cache hit ratio).  
+  * Optional: Web Vitals and frontend logs sent to backend.
 
-### **6\. Scalability Plan**
+* **Database (MongoDB)**:  
+  * From Atlas: operations per second, CPU/IO, replication lag, slow queries.
 
-**Horizontal scaling:**
+### **Logs**
 
-* Backend:
+* Application logs from FastAPI via **structured JSON logging** to Cloud Logging:  
+  * Request traces (request ID, user ID if available).  
+  * Error stack traces.  
+  * Significant business events.  
+* LB and CDN access logs.  
+* MongoDB Atlas logs (in Atlas console; optionally exported to a centralized logging solution if needed).
 
-  * GKE **Horizontal Pod Autoscaler (HPA)** based on CPU/requests/latency.
+### **Dashboards**
 
-  * Multiple replicas per zone for HA.
+In **Cloud Monitoring**:
 
-* Frontend:
+1. **API Service Dashboard**:  
+   * Requests, latency, error rate by endpoint.  
+   * Instance count, CPU/memory per Cloud Run service.
 
-  * Static content via Cloud Storage \+ Cloud CDN scales automatically.
+2. **Frontend / User Experience Dashboard**:  
+   * CDN/LB traffic.  
+   * Cache hit ratio, response times.
 
-* DB:
+3. **DB Health Dashboard** (via Atlas UI):  
+   * Ops/sec, slow query count, CPU/IO, replication lag.
 
-  * MongoDB Atlas cluster with auto-scaling for CPU, storage, and connections.
+### **Alerts**
 
-**Vertical scaling:**
+Configure alerts for:
 
-* Resize GKE node pool machine types if CPU/memory consistently high.
+* **5xx error rate** above threshold (e.g. \>1% over 5–10 minutes).  
+* **Latency spikes** (p95 \> X ms for sustained period).  
+* **Cloud Run instance failures** or abnormal restarts.  
+* **DB metrics**:  
+  * High replication lag.  
+  * Disk / CPU saturation.  
+* **Error budget burn rate** (if SLOs are defined).
 
-* Scale MongoDB Atlas cluster tier.
+Alerts can be sent to **Slack, email, or PagerDuty**.
 
-**High availability:**
+## **7\. Security & Hardening**
 
-* **Multi-zone** GKE cluster (e.g., `europe-west3-a/b/c`).
+### **Secrets handling**
 
-* MongoDB replica set across zones in the same region.
+* All sensitive data in **Secret Manager**, never in source code or plain env files.  
+* Cloud Run service account granted only secretmanager.versions.access for specific secrets.
 
-* External Load Balancer across zones for resilient ingress.
+### **IAM roles & permissions**
 
-### **7\. Monitoring & Alerting**
+* **Least privilege**:  
+  * Separate service accounts:  
+    * frontend-build-sa (Cloud Build).  
+    * backend-run-sa (Cloud Run runtime).  
+  * Backend SA only has:  
+    * Access to Secret Manager secrets.  
+    * Access to VPC connector.  
+  * IAM for developers is scoped per environment (e.g. dev can deploy, prod deployment requires approval).
 
-Use **Cloud Monitoring** \+ **Cloud Logging** as the primary observability stack.
+### **HTTPS/TLS**
 
-**Metrics to track:**
+* External access only via **HTTPS**:  
+  * HTTPS Load Balancer terminates TLS using **managed certificates**.  
+* If needed, mTLS between backend and DB can be configured via Atlas.
 
-* **FastAPI / backend:**
+### **Rate limiting & WAF**
 
-  * Request rate, latency (p95/p99), 4xx/5xx error rates.
+* Use **Cloud Armor** on the HTTPS LB for:  
+  * Basic rate limiting per IP.  
+  * Protection against common OWASP top 10 attacks.  
+  * Geo-based rules if necessary.
 
-  * Pod restarts, HPA scaling events.
+### **Firewalls / security groups**
 
-* **MongoDB:**
+* **VPC firewall rules**:  
+  * Allow Cloud Run to access MongoDB Atlas IP ranges via VPC peering.  
+  * Deny all inbound traffic to internal subnets from the internet.  
+* MongoDB: no public IP; only peered VPC access.
 
-  * CPU, memory, connections, replication lag, slow queries (via Atlas).
+### **Audit logging**
 
-* **Infra:**
+* Enable **Cloud Audit Logs** for:  
+  * Admin operations (deployments, IAM changes).  
+  * Access to Secret Manager.  
+* Periodically review logs and set alerts for suspicious activities (e.g. repeated secret access failures).
 
-  * GKE node CPU/RAM, disk, network.
+## **8\. Backup & Recovery**
 
-  * Load Balancer request/latency metrics.
+### **DB backup strategy**
 
-Tooling:
+* Rely on **MongoDB Atlas automated backups**:  
+  * Daily snapshots \+ **point-in-time recovery**.  
+  * Retention set according to requirements (e.g. 14–30 days).  
+* Test recovery regularly into a **separate staging cluster** to verify backup integrity.
 
-* **Cloud Monitoring** dashboards:
+### **RTO & RPO**
 
-  * API performance dashboard.
+* **RPO (Recovery Point Objective)**:  
+  * With point-in-time backups, RPO can be as low as **a few minutes**.
 
-  * GKE cluster and node health.
+* **RTO (Recovery Time Objective)**:  
+  * Target **\< 1 hour** for major DB failure:  
+    * Spin up a new Atlas cluster from backups.  
+    * Update DB connection string in Secret Manager.  
+    * Redeploy/roll Cloud Run with new secret (or trigger configuration rollout).
 
-* **Cloud Logging:**
+### **Failure scenarios & response**
 
-  * Structured JSON logs from FastAPI, tagged with trace IDs/request IDs.
+1. **Single instance / revision issue (bug in new release)**:  
+   * Detect via canary metrics.  
+   * **Rollback** by routing 100% traffic to previous Cloud Run revision.
 
-* Optionally integrate:
+2. **Region-level issue for Cloud Run**:  
+   * Optionally maintain a **warm standby** Cloud Run service in another region.  
+   * DNS or LB failover to the standby region.
 
-  * **Cloud Trace** and **Cloud Profiler** for deeper performance insight.
+3. **DB corruption / accidental data deletion**:  
+   * Use Atlas **point-in-time restore** to a new cluster.  
+   * Temporarily put application into **read-only mode** or maintenance.
 
-  * Atlas monitoring for DB-level visibility.
+4. **Static assets issue**:  
+   * Revert LB backend to previous Cloud Storage release.  
+   * One command / config change; minimal RTO.
 
-**Alerts (Cloud Monitoring Alerting Policies):**
-
-* 5xx error rate \> N% for X minutes.
-
-* Latency p95 above threshold.
-
-* GKE node pool CPU \>80% for sustained period.
-
-* MongoDB Atlas CPU / connections / disk near limits.
-
-* Frequent pod restarts or failing health checks.
-
-### **8\. Security & Hardening**
-
-* **Secrets:**
-
-  * Store secrets in **Secret Manager**.
-
-  * Access via GKE Workload Identity and service accounts.
-
-* **IAM:**
-
-  * Principle of least privilege for:
-
-    * GKE node service accounts.
-
-    * CI/CD service accounts (build and deploy).
-
-    * Application service accounts (read-only access to specific secrets, logs, etc.).
-
-* **Network security:**
-
-  * VPC with private subnets for GKE and DB.
-
-  * **Cloud NAT** for outbound internet from private workloads.
-
-  * **VPC peering / Private Service Connect** with MongoDB Atlas; DB not exposed publicly.
-
-  * **GKE Network Policies** to restrict pod-to-pod communication if needed.
-
-* **TLS / HTTPS:**
-
-  * **Managed SSL certificates** on the External HTTPS Load Balancer.
-
-  * All client traffic encrypted; internal service traffic restricted to private network.
-
-* **WAF & rate limiting:**
-
-  * **Cloud Armor** policies in front of Load Balancer for:
-
-    * Basic OWASP protections.
-
-    * IP allow/deny lists.
-
-    * Rate limiting rules.
-
-  * Optional app-level throttling on sensitive endpoints.
-
-* **Audit & access logging:**
-
-  * Load Balancer access logs to Cloud Logging.
-
-  * Admin / auth actions logged in backend.
-
-  * **Cloud Audit Logs** for service-level operations.
-
-### **9\. Backup & Recovery**
-
-* **Database backups:**
-
-  * Use **MongoDB Atlas automated backups** with point-in-time recovery (PITR) for production.
-
-  * Retention policy (e.g., 7–30 days depending on requirements).
-
-* **Configuration backups:**
-
-  * GKE manifests stored in git.
-
-  * Optionally export cluster configs (e.g., `gcloud` \+ Terraform if used).
-
-**RTO/RPO assumptions:**
-
-* Example targets:
-
-  * **RTO:** 30–60 minutes (restore DB \+ redeploy services).
-
-  * **RPO:** \< 15 minutes (with PITR) or daily backups (if cheaper, but less strict).
-
-* Clarify chosen values and why they’re acceptable for this application.
-
-**Failure scenarios:**
-
-* **Pod crash or bad deployment:**
-
-  * K8s restarts pods automatically.
-
-  * Roll back deployment via `kubectl rollout undo` or CI/CD tooling.
-
-* **Node failure:**
-
-  * GKE reschedules pods on healthy nodes in other zones.
-
-* **MongoDB primary failure:**
-
-  * Atlas automatic failover to a secondary node.
-
-  * Application reconnects transparently (driver \+ retry logic).
-
-* **Regional outage (optional extension):**
-
-  * Secondary GCP region with a warm standby GKE cluster and replicated Atlas cluster.
-
-  * DNS / Load Balancer failover plan documented.
-
+This design uses **Cloud Storage \+ CDN, Cloud Run, Secret Manager, Cloud Build, Artifact Registry, and MongoDB Atlas** as the core building blocks. It deliberately avoids Kubernetes and other complex components, keeping the system **operationally simple** while still supporting **zero-downtime deployments, horizontal scaling, security best practices, and robust backup & recovery**.
